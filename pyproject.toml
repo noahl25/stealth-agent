@@ -1,0 +1,13 @@
+[project]
+name = "stealth-agent"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "anthropic>=0.105.2",
+    "cloakbrowser>=0.3.31",
+    "mcp[cli]>=1.27.2",
+    "python-dotenv>=1.0.0",
+    "stagehand>=3.21.0",
+]
