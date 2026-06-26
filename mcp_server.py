@@ -3,6 +3,14 @@ Stealth browser MCP server — expose CloakBrowser tools over MCP.
 
 Usage:
     uv run python mcp_server.py              # stdio (for Claude Desktop / agent integration)
+
+Concurrency model — SESSIONS:
+    All pages live in ONE persistent browser context (shared cookies/login). Each
+    "tab" is a SESSION = its own page + its own element-ref store, addressed by a
+    session id ("s1", "s2", ...). Every tool takes an optional `session` arg; pass a
+    session id so concurrent agents each drive their OWN page and never clobber a
+    shared active-tab pointer. Omit `session` to use the default session (single-agent
+    use, unchanged behaviour).
 """
 
 from __future__ import annotations
@@ -17,18 +25,23 @@ from dotenv import load_dotenv
 from mcp.server.fastmcp import Context, FastMCP, Image
 from mcp.server.session import ServerSession
 
-from main import RefStore, TabManager, take_snapshot, _wrap_page_content
+from main import RefStore, take_snapshot, _wrap_page_content
 
 load_dotenv()
 
 
 class BrowserState:
-    """Mutable container for the browser, created/destroyed on demand."""
+    """One persistent browser context holding many independent SESSIONS.
+
+    sessions: id -> {"page": Page, "refs": RefStore}. Per-session state is what makes
+    concurrent multi-agent use safe — no shared active-tab pointer.
+    """
 
     def __init__(self) -> None:
         self.context: Any | None = None
-        self.tabs: TabManager | None = None
-        self.refs: RefStore | None = None
+        self.sessions: dict[str, dict] = {}
+        self._default: str | None = None
+        self._counter: int = 0
         self._xvfb_proc: Any | None = None
         self._prev_display: str | None = None
 
@@ -95,15 +108,30 @@ class BrowserState:
             os.environ["DISPLAY"] = self._prev_display
         self._prev_display = None
 
+    def _register(self, page: Any) -> str:
+        """Track a page as a new session; return its id."""
+        self._counter += 1
+        sid = f"s{self._counter}"
+        self.sessions[sid] = {"page": page, "refs": RefStore()}
+        return sid
+
+    def _adopt_orphans(self) -> list[str]:
+        """Register any context pages not yet tracked (e.g. popups). Returns new ids."""
+        if not self.context:
+            return []
+        known = {s["page"] for s in self.sessions.values()}
+        new = []
+        for p in self.context.pages:
+            if p not in known:
+                new.append(self._register(p))
+        return new
+
     async def open(self, headed: bool = False, use_xvfb: bool = False) -> str:
         if self.is_open:
-            return "Browser is already open."
+            return (f"Browser already open ({len(self.sessions)} session(s)). "
+                    f"Use new_tab for an isolated session.")
         from cloakbrowser import launch_persistent_context_async
 
-        # Persistent profile: cookies, logins, and localStorage survive across
-        # sessions (also avoids incognito detection). Default location is
-        # ~/stealth-browser so it resolves consistently on any machine;
-        # override with the STEALTH_BROWSER_PROFILE env var.
         profile_dir = os.environ.get(
             "STEALTH_BROWSER_PROFILE", os.path.expanduser("~/stealth-browser")
         )
@@ -111,52 +139,70 @@ class BrowserState:
 
         xvfb_disp: str | None = None
         try:
-            # On a headless server with no real X display, headed mode needs a
-            # virtual display. Only relevant when headed=True.
             if headed and use_xvfb:
                 xvfb_disp = await self._start_xvfb()
-
-            # Returns a BrowserContext directly (no separate Browser object).
             self.context = await launch_persistent_context_async(
-                profile_dir,
-                headless=not headed,
-                viewport={"width": 1280, "height": 720},
+                profile_dir, headless=not headed, viewport={"width": 1280, "height": 720}
             )
         except Exception:
             await self._stop_xvfb()
             raise
 
-        # A persistent context starts with one blank page; reuse it instead of
-        # opening a second tab.
-        first_page = (
-            self.context.pages[0]
-            if self.context.pages
-            else await self.context.new_page()
-        )
-        await first_page.goto("about:blank")
-        self.tabs = TabManager(self.context)
-        self.tabs.add(first_page)
-        self.refs = RefStore()
+        page = self.context.pages[0] if self.context.pages else await self.context.new_page()
+        await page.goto("about:blank")
+        self._default = self._register(page)
         mode = "headed" if headed else "headless"
         extra = f", xvfb={xvfb_disp}" if xvfb_disp else ""
-        return f"Browser opened ({mode}, profile={profile_dir}{extra})."
+        return f"Browser opened ({mode}, profile={profile_dir}{extra}). Default session: {self._default}."
+
+    async def open_session(self, url: str = "about:blank") -> str:
+        if not self.is_open:
+            raise RuntimeError("Browser is not open. Call open_browser first.")
+        page = await self.context.new_page()
+        await page.goto(url or "about:blank", wait_until="domcontentloaded")
+        return self._register(page)
+
+    async def close_session(self, sid: str) -> str:
+        s = self.sessions.pop(sid, None)
+        if not s:
+            return f"No such session '{sid}'."
+        try:
+            await s["page"].close()
+        except Exception:
+            pass
+        if self._default == sid:
+            self._default = next(iter(self.sessions), None)
+        return f"Closed session {sid}. Remaining: {', '.join(self.sessions) or '(none)'}."
+
+    def resolve(self, session: str | None = None):
+        """Return (page, refs, sid) for a session id, or the default session."""
+        if not self.is_open:
+            raise RuntimeError("Browser is not open. Call open_browser first.")
+        sid = session or self._default
+        s = self.sessions.get(sid)
+        if not s:
+            raise RuntimeError(
+                f"No such session '{sid}'. Open one with new_tab; see list_tabs."
+            )
+        return s["page"], s["refs"], sid
+
+    def list_sessions(self) -> list[dict]:
+        return [
+            {"session": sid, "url": s["page"].url, "default": sid == self._default}
+            for sid, s in self.sessions.items()
+        ]
 
     async def close(self) -> str:
         if not self.is_open:
             return "Browser is not open."
-        # Closing the persistent context shuts down the browser and flushes the
-        # profile (cookies/storage) to disk.
-        await self.context.close()
-        self.context = None
-        self.tabs = None
-        self.refs = None
-        await self._stop_xvfb()
+        try:
+            await self.context.close()
+        finally:
+            self.context = None
+            self.sessions = {}
+            self._default = None
+            await self._stop_xvfb()
         return "Browser closed."
-
-    def require(self) -> tuple[TabManager, RefStore]:
-        if not self.is_open:
-            raise RuntimeError("Browser is not open. Call open_browser first.")
-        return self.tabs, self.refs  # type: ignore[return-value]
 
 
 _state = BrowserState()
@@ -170,19 +216,46 @@ mcp = FastMCP("stealth-browser")
 
 @mcp.tool()
 async def open_browser(headed: bool = False, use_xvfb: bool = False) -> str:
-    """Launch the stealth browser. Must be called before any other browser tool.
+    """Launch the stealth browser (idempotent — the first caller opens it; others reuse it).
+    Then call new_tab to get your OWN session id for concurrent-safe use.
 
-    Set headed=true to show the browser window. On a headless server with no
-    real display, also set use_xvfb=true to run the headed browser inside a
-    virtual X display (Xvfb), which is started and torn down automatically.
-    use_xvfb is ignored when headed=false (headless needs no display)."""
+    Set headed=true to show the window; on a display-less server also set use_xvfb=true
+    to run headed inside a virtual X display (auto start/stop). use_xvfb is ignored when headed=false."""
     return await _state.open(headed=headed, use_xvfb=use_xvfb)
 
 
 @mcp.tool()
 async def close_browser() -> str:
-    """Close the browser and free resources. Call when you're done with browser tasks."""
+    """Close the browser and ALL sessions. Call when the whole swarm is done with the browser."""
     return await _state.close()
+
+
+# ---------------------------------------------------------------------------
+# Tabs / sessions (concurrency)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def new_tab(url: str = "about:blank") -> str:
+    """Open a NEW isolated tab/session and return its session id. Pass that id as the
+    `session` arg to every other tool so concurrent agents never share a page. Each
+    session has its own page + element refs; all sessions share one browser (cookies/login)."""
+    sid = await _state.open_session(url)
+    page, _refs, _ = _state.resolve(sid)
+    title = await page.title()
+    return f'Opened session {sid}: {title or url}. Pass session="{sid}" to other tools.'
+
+
+@mcp.tool()
+async def list_tabs() -> str:
+    """List open tabs/sessions (id, url, which is default). Also adopts any popups."""
+    _state._adopt_orphans()
+    return json.dumps(_state.list_sessions(), indent=2)
+
+
+@mcp.tool()
+async def close_tab(session: str) -> str:
+    """Close a tab/session by its id (e.g. "s2")."""
+    return await _state.close_session(session)
 
 
 # ---------------------------------------------------------------------------
@@ -190,24 +263,23 @@ async def close_browser() -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-async def snapshot() -> str:
-    """Get a compact accessibility snapshot of the page with short refs (@e1, @e2...)
-    for each interactive element. Use these refs in click, fill, select, check,
-    get_text. This is your PRIMARY tool for understanding the page — much cheaper
-    than a screenshot. Refs are invalidated after page changes; re-snapshot to get
-    fresh ones."""
-    tabs, refs = _state.require()
-    tree = await take_snapshot(tabs.page, refs)
-    header = f"Page: {tabs.page.url} | {refs.count} interactive refs"
+async def snapshot(session: str | None = None) -> str:
+    """Compact accessibility snapshot with short refs (@e1, @e2...) for interactive
+    elements — your PRIMARY tool for understanding a page (cheaper than a screenshot).
+    Refs are scoped to this session and invalidated after the page changes; re-snapshot
+    for fresh ones. Pass `session` to target your own tab."""
+    page, refs, sid = _state.resolve(session)
+    tree = await take_snapshot(page, refs)
+    header = f"Session {sid} | Page: {page.url} | {refs.count} interactive refs"
     return f"{header}\n\n{_wrap_page_content(tree)}"
 
 
 @mcp.tool()
-async def get_text(ref: str) -> str:
+async def get_text(ref: str, session: str | None = None) -> str:
     """Get the text content of an element by ref (@e1) or CSS/XPath selector."""
-    tabs, refs = _state.require()
+    page, refs, _ = _state.resolve(session)
     selector = refs.resolve(ref)
-    loc = tabs.page.locator(selector).first
+    loc = page.locator(selector).first
     text = await loc.text_content(timeout=5000)
     return _wrap_page_content((text or "").strip() or "(empty)")
 
@@ -216,11 +288,11 @@ async def get_text(ref: str) -> str:
 async def get_page_content(
     selector: str | None = None,
     max_length: int = 10000,
+    session: str | None = None,
 ) -> str:
-    """Extract readable text from the page or a section. Use for articles,
-    emails, posts, docs, search results. Optionally scope to a CSS selector."""
-    tabs, refs = _state.require()
-    page = tabs.page
+    """Extract readable text from the page or a section. Use for articles, posts, docs,
+    search results, filings. Optionally scope to a CSS selector."""
+    page, refs, _ = _state.resolve(session)
     if selector:
         text = await page.locator(selector).first.inner_text(timeout=5000)
     else:
@@ -236,31 +308,34 @@ async def get_page_content(
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-async def click(ref: str) -> str:
+async def click(ref: str, session: str | None = None) -> str:
     """Click an element by ref (@e1) or selector. Use snapshot first to get refs."""
-    tabs, refs = _state.require()
+    page, refs, _ = _state.resolve(session)
     selector = refs.resolve(ref)
-    await tabs.page.locator(selector).first.click(timeout=5000)
+    await page.locator(selector).first.click(timeout=5000)
     await asyncio.sleep(0.3)
-    await tabs.sync_new_popups()
-    return f"Clicked {ref}"
+    popups = _state._adopt_orphans()
+    msg = f"Clicked {ref}"
+    if popups:
+        msg += f" (popup opened as session {', '.join(popups)})"
+    return msg
 
 
 @mcp.tool()
-async def fill(ref: str, value: str) -> str:
+async def fill(ref: str, value: str, session: str | None = None) -> str:
     """Clear an input and type new text. Use ref (@e3) or selector."""
-    tabs, refs = _state.require()
+    page, refs, _ = _state.resolve(session)
     selector = refs.resolve(ref)
-    await tabs.page.locator(selector).first.fill(value, timeout=5000)
+    await page.locator(selector).first.fill(value, timeout=5000)
     return f"Filled {ref} with: {value}"
 
 
 @mcp.tool()
-async def select(ref: str, value: str) -> str:
+async def select(ref: str, value: str, session: str | None = None) -> str:
     """Select an option from a dropdown by ref or selector."""
-    tabs, refs = _state.require()
+    page, refs, _ = _state.resolve(session)
     selector = refs.resolve(ref)
-    loc = tabs.page.locator(selector).first
+    loc = page.locator(selector).first
     try:
         await loc.select_option(value=value, timeout=5000)
     except Exception:
@@ -269,11 +344,11 @@ async def select(ref: str, value: str) -> str:
 
 
 @mcp.tool()
-async def check(ref: str, checked: bool = True) -> str:
+async def check(ref: str, checked: bool = True, session: str | None = None) -> str:
     """Check or uncheck a checkbox/radio by ref or selector."""
-    tabs, refs = _state.require()
+    page, refs, _ = _state.resolve(session)
     selector = refs.resolve(ref)
-    loc = tabs.page.locator(selector).first
+    loc = page.locator(selector).first
     if checked:
         await loc.check(timeout=5000)
     else:
@@ -286,32 +361,30 @@ async def check(ref: str, checked: bool = True) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-async def screenshot() -> Image:
-    """Take a screenshot. Use ONLY when you need visual info — CAPTCHAs,
-    canvas, bot challenges, visual layout. Prefer snapshot for normal pages."""
-    tabs, refs = _state.require()
-    png_bytes = await tabs.page.screenshot(full_page=False)
+async def screenshot(session: str | None = None) -> Image:
+    """Take a screenshot. Use ONLY when you need visual info — CAPTCHAs, canvas, bot
+    challenges, visual layout. Prefer snapshot for normal pages."""
+    page, refs, _ = _state.resolve(session)
+    png_bytes = await page.screenshot(full_page=False)
     return Image(data=png_bytes, format="png")
 
 
 @mcp.tool()
-async def click_xy(x: int, y: int, description: str = "") -> Image:
-    """Click at pixel coordinates. For CAPTCHAs, canvas, bot-protected elements.
-    Take a screenshot first to find coordinates. Returns follow-up screenshot."""
-    tabs, refs = _state.require()
-    await tabs.page.mouse.click(x, y)
+async def click_xy(x: int, y: int, description: str = "", session: str | None = None) -> Image:
+    """Click at pixel coordinates. For CAPTCHAs, canvas, bot-protected elements. Take a
+    screenshot first to find coordinates. Returns a follow-up screenshot."""
+    page, refs, _ = _state.resolve(session)
+    await page.mouse.click(x, y)
     await asyncio.sleep(0.5)
-    await tabs.sync_new_popups()
-    png_bytes = await tabs.page.screenshot(full_page=False)
+    _state._adopt_orphans()
+    png_bytes = await page.screenshot(full_page=False)
     return Image(data=png_bytes, format="png")
 
 
 @mcp.tool()
-async def type_xy(x: int, y: int, text: str, clear_first: bool = True) -> Image:
-    """Click at coordinates then type. For non-standard inputs.
-    Returns follow-up screenshot."""
-    tabs, refs = _state.require()
-    page = tabs.page
+async def type_xy(x: int, y: int, text: str, clear_first: bool = True, session: str | None = None) -> Image:
+    """Click at coordinates then type. For non-standard inputs. Returns a follow-up screenshot."""
+    page, refs, _ = _state.resolve(session)
     await page.mouse.click(x, y)
     await asyncio.sleep(0.15)
     if clear_first:
@@ -328,20 +401,20 @@ async def type_xy(x: int, y: int, text: str, clear_first: bool = True) -> Image:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-async def goto(url: str) -> str:
-    """Navigate the current tab to a URL."""
-    tabs, refs = _state.require()
-    await tabs.page.goto(url, wait_until="domcontentloaded")
-    title = await tabs.page.title()
-    return f"Navigated to {url} — {title}"
+async def goto(url: str, session: str | None = None) -> str:
+    """Navigate this session's tab to a URL."""
+    page, refs, sid = _state.resolve(session)
+    await page.goto(url, wait_until="domcontentloaded")
+    title = await page.title()
+    return f"[{sid}] Navigated to {url} — {title}"
 
 
 @mcp.tool()
-async def navback() -> str:
+async def navback(session: str | None = None) -> str:
     """Navigate back (browser back button)."""
-    tabs, refs = _state.require()
-    await tabs.page.go_back(wait_until="domcontentloaded")
-    return f"Back — {tabs.page.url}"
+    page, refs, sid = _state.resolve(session)
+    await page.go_back(wait_until="domcontentloaded")
+    return f"[{sid}] Back — {page.url}"
 
 
 # ---------------------------------------------------------------------------
@@ -349,26 +422,26 @@ async def navback() -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-async def keys(method: str, value: str) -> str:
-    """Keyboard input. method='press' for Enter, Tab, Escape, Backspace,
-    ArrowDown, Control+a. method='type' to type text into focused element."""
-    tabs, refs = _state.require()
+async def keys(method: str, value: str, session: str | None = None) -> str:
+    """Keyboard input. method='press' for Enter, Tab, Escape, Backspace, ArrowDown,
+    Control+a. method='type' to type text into the focused element."""
+    page, refs, _ = _state.resolve(session)
     if method == "press":
-        await tabs.page.keyboard.press(value)
+        await page.keyboard.press(value)
     else:
-        await tabs.page.keyboard.type(value, delay=80)
+        await page.keyboard.type(value, delay=80)
     return f"Key {method}: {value}"
 
 
 @mcp.tool()
-async def scroll(direction: str, percent: int = 80) -> str:
+async def scroll(direction: str, percent: int = 80, session: str | None = None) -> str:
     """Scroll up or down by percentage of viewport."""
-    tabs, refs = _state.require()
-    viewport = tabs.page.viewport_size or {"height": 720}
+    page, refs, _ = _state.resolve(session)
+    viewport = page.viewport_size or {"height": 720}
     delta = int(viewport["height"] * percent / 100)
     if direction == "up":
         delta = -delta
-    await tabs.page.mouse.wheel(0, delta)
+    await page.mouse.wheel(0, delta)
     await asyncio.sleep(0.3)
     return f"Scrolled {direction} {percent}%"
 
@@ -378,44 +451,6 @@ async def wait(time_ms: int = 2000) -> str:
     """Wait milliseconds. Use after actions that trigger loading."""
     await asyncio.sleep(time_ms / 1000)
     return f"Waited {time_ms}ms"
-
-
-# ---------------------------------------------------------------------------
-# Tabs
-# ---------------------------------------------------------------------------
-
-@mcp.tool()
-async def new_tab(url: str = "about:blank") -> str:
-    """Open a new tab, optionally navigate to URL."""
-    tabs, refs = _state.require()
-    idx = await tabs.new_tab(url)
-    title = await tabs.page.title()
-    return f"Opened tab {idx}: {title or url}"
-
-
-@mcp.tool()
-async def switch_tab(index: int) -> str:
-    """Switch to tab by index."""
-    tabs, refs = _state.require()
-    tabs.switch(index)
-    title = await tabs.page.title()
-    return f"Tab {index}: {title} ({tabs.page.url})"
-
-
-@mcp.tool()
-async def list_tabs() -> str:
-    """List all open tabs."""
-    tabs, refs = _state.require()
-    await tabs.sync_new_popups()
-    return json.dumps(tabs.list_tabs(), indent=2)
-
-
-@mcp.tool()
-async def close_tab(index: int | None = None) -> str:
-    """Close tab by index (omit for current tab)."""
-    tabs, refs = _state.require()
-    await tabs.close_tab(index)
-    return f"Closed. Now tab {tabs.active_index}: {tabs.page.url}"
 
 
 # ---------------------------------------------------------------------------
