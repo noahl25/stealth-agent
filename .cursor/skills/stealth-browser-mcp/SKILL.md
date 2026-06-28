@@ -53,6 +53,10 @@ Every page-acting tool accepts an optional `session` arg (defaults to the defaul
 - `new_tab(url?)` — open a new isolated session; **returns its session id** to pass as `session=`.
 - `list_tabs()` — list sessions (id, url, which is default); also adopts any popups.
 - `close_tab(session)` — close a session by id (e.g. `"s2"`).
+- `switch_tab(session)` — back-compat: set the default session, so later calls that omit `session` act on it. In a swarm, prefer explicit `session=`.
+
+### Cookies / session export
+- `dump_cookies(path, domain?)` — write the browser's current cookies (decrypted, from the live context) to `path` in **Netscape cookie-file format** (what yt-dlp / curl / `requests` want). Optional `domain` substring filter (e.g. `"instagram"`). Use after logging into a site so other tools can reuse the authenticated session — no manual DevTools export needed.
 
 ### Read page
 - `snapshot(session?)` — accessibility tree with refs. **Use first.**
